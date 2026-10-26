@@ -260,12 +260,38 @@ exports.registerFaces = async (req, res) => {
 
     console.log(`[FACE REGISTER] Embeddings generated: ${result.embeddings.length}`);
 
+    // Outlier filtering: remove any embedding that deviates significantly from centroid
+    let cleanEmbeddings = result.embeddings;
+    if (result.embeddings.length >= 5) {
+      const centroid = new Array(128).fill(0);
+      for (const emb of result.embeddings) {
+        for (let k = 0; k < 128; k++) centroid[k] += emb[k];
+      }
+      for (let k = 0; k < 128; k++) centroid[k] /= result.embeddings.length;
+
+      const filtered = result.embeddings.filter((emb) => {
+        let dot = 0, n1 = 0, n2 = 0;
+        for (let k = 0; k < 128; k++) {
+          dot += emb[k] * centroid[k];
+          n1 += emb[k] * emb[k];
+          n2 += centroid[k] * centroid[k];
+        }
+        const dist = 1.0 - (dot / (Math.sqrt(n1) * Math.sqrt(n2)));
+        return dist < 0.40;
+      });
+
+      if (filtered.length >= 5) {
+        console.log(`[FACE REGISTER] Retained ${filtered.length}/${result.embeddings.length} clean embeddings (pruned ${result.embeddings.length - filtered.length} outliers).`);
+        cleanEmbeddings = filtered;
+      }
+    }
+
     // Fix Mongoose VersionError using atomic update
     await Student.findByIdAndUpdate(
       studentId,
       {
         $set: {
-          embeddings: result.embeddings,
+          embeddings: cleanEmbeddings,
           isProcessingFaceRegistration: false
         }
       },

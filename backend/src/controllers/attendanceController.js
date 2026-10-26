@@ -66,17 +66,71 @@ exports.markAttendance = async (req, res) => {
 const temporalTracker = {};
 
 // Recognition Accuracy Configuration
-const FACE_MATCH_THRESHOLD = parseFloat(process.env.FACE_MATCH_THRESHOLD) || 0.55; // SFace official threshold is ~0.64; 0.55 is secure and accurate
-const MIN_RECOGNITION_MARGIN = 0.02; // Small margin to prevent confusion
-const MIN_FACE_WIDTH = 25; // Accept standard webcam distance
-const MIN_FACE_HEIGHT = 25;
-const CONSECUTIVE_MATCHES_REQUIRED = 1; // Immediate detection on match
+const FACE_MATCH_THRESHOLD = parseFloat(process.env.FACE_MATCH_THRESHOLD) || 0.42; // Calibrated for OpenCV SFace 1-to-N identification (separation >= 0.46)
+const MIN_RECOGNITION_MARGIN = 0.05; // Strict margin prevents picking wrong name when two candidates are close
+const MIN_FACE_WIDTH = 50; // Filter small/noisy background faces
+const MIN_FACE_HEIGHT = 50;
+const CONSECUTIVE_MATCHES_REQUIRED = 2; // Require 2 consecutive matching frames for stable confirmation
 const liveTemporalTracker = {}; // Keyed by session_studentId for real-time validation
 
 // P1: In-Memory Student Cache to prevent MongoDB bottleneck
 let studentEmbeddingsCache = null;
 let studentEmbeddingsCacheTime = 0;
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Outlier pruner: removes noisy embeddings captured during bad lighting/movement during registration
+const filterStudentEmbeddings = (embeddings) => {
+  if (!embeddings || embeddings.length <= 2) return embeddings || [];
+  const centroid = new Array(128).fill(0);
+  for (const emb of embeddings) {
+    for (let k = 0; k < 128; k++) centroid[k] += emb[k];
+  }
+  for (let k = 0; k < 128; k++) centroid[k] /= embeddings.length;
+
+  const valid = embeddings.filter(emb => cosineDistance(emb, centroid) < 0.40);
+  return valid.length >= 3 ? valid : embeddings;
+};
+
+// Robust multi-vector matching: uses average of top-2 closest reference embeddings to avoid single-embedding false matches
+const getStudentMatchDistance = (faceEmbedding, studentEmbeddings) => {
+  if (!studentEmbeddings || studentEmbeddings.length === 0) return 1.0;
+  const dists = [];
+  for (const ref of studentEmbeddings) {
+    dists.push(cosineDistance(faceEmbedding, ref));
+  }
+  dists.sort((a, b) => a - b);
+  return dists.length >= 2 ? (dists[0] + dists[1]) / 2.0 : dists[0];
+};
+
+// Helper to load or refresh student embeddings cache with outlier filtering
+const getCachedStudents = async () => {
+  if (!studentEmbeddingsCache || (Date.now() - studentEmbeddingsCacheTime) > CACHE_TTL_MS) {
+    console.log('[CACHE MISS] Fetching student embeddings from MongoDB and filtering outliers...');
+    const rawStudents = await Student.find(
+      {
+        embeddings: {
+          $exists: true,
+          $not: { $size: 0 }
+        }
+      },
+      {
+        _id: 1,
+        name: 1,
+        rollNumber: 1,
+        branch: 1,
+        section: 1,
+        embeddings: 1
+      }
+    ).lean();
+
+    studentEmbeddingsCache = rawStudents.map((s) => ({
+      ...s,
+      embeddings: filterStudentEmbeddings(s.embeddings)
+    }));
+    studentEmbeddingsCacheTime = Date.now();
+  }
+  return studentEmbeddingsCache;
+};
 
 // Optional helper to forcefully invalidate cache from other routes
 exports.invalidateStudentCache = () => {
@@ -117,23 +171,41 @@ exports.markAttendanceByFace = async (req, res) => {
           faces: [],
           message: result.message || 'No face detected in webcam feed.'
         });
-      }
-
-      const todayStr = getLocalDateString();
+      }      const todayStr = getLocalDateString();
       const processedFaces = [];
+      const students = await getCachedStudents();
 
-      for (const face of result.faces) {
-        if (!face.matched) {
-          processedFaces.push({
-            ...face,
-            status: 'unknown'
-          });
+      for (let i = 0; i < result.faces.length; i++) {
+        const face = result.faces[i];
+
+        if (face.bbox && (face.bbox[2] < MIN_FACE_WIDTH || face.bbox[3] < MIN_FACE_HEIGHT)) {
+          processedFaces.push({ ...face, matched: false, status: 'unknown' });
           continue;
         }
 
-        const student = await Student.findById(face.student_id);
+        if (!face.embedding || face.embedding.length !== 128) {
+          processedFaces.push({ ...face, matched: false, status: 'unknown' });
+          continue;
+        }
 
-        if (!student) {
+        let candidateMatch = null;
+        let candidateBestDistance = 1.0;
+        let candidateSecondBestDistance = 1.0;
+
+        for (const student of students) {
+          if (!student.embeddings || student.embeddings.length === 0) continue;
+          const dist = getStudentMatchDistance(face.embedding, student.embeddings);
+          if (dist < candidateBestDistance) {
+            candidateSecondBestDistance = candidateBestDistance;
+            candidateBestDistance = dist;
+            candidateMatch = student;
+          } else if (dist < candidateSecondBestDistance) {
+            candidateSecondBestDistance = dist;
+          }
+        }
+
+        const margin = candidateSecondBestDistance - candidateBestDistance;
+        if (!candidateMatch || candidateBestDistance > FACE_MATCH_THRESHOLD || margin < MIN_RECOGNITION_MARGIN) {
           processedFaces.push({
             ...face,
             matched: false,
@@ -142,18 +214,18 @@ exports.markAttendanceByFace = async (req, res) => {
           continue;
         }
 
+        const student = candidateMatch;
         const existingRecord = await Attendance.findOne({
           student: student._id,
           date: todayStr
         });
 
         let alreadyMarked = false;
-
         if (existingRecord && existingRecord.status === 'Present') {
           alreadyMarked = true;
-
           processedFaces.push({
             ...face,
+            matched: true,
             status: 'recognized',
             alreadyMarked: true,
             student: {
@@ -164,68 +236,28 @@ exports.markAttendanceByFace = async (req, res) => {
               section: student.section
             }
           });
-
-          continue;
-        }
-
-        const now = Date.now();
-        const studentIdStr = student._id.toString();
-
-        if (!temporalTracker[studentIdStr]) {
-          temporalTracker[studentIdStr] = {
-            count: 1,
-            lastSeen: now
-          };
-        } else {
-          if (now - temporalTracker[studentIdStr].lastSeen > 5000) {
-            temporalTracker[studentIdStr] = {
-              count: 1,
-              lastSeen: now
-            };
-          } else {
-            temporalTracker[studentIdStr].count += 1;
-            temporalTracker[studentIdStr].lastSeen = now;
-          }
-        }
-
-        const currentCount = temporalTracker[studentIdStr].count;
-
-        if (currentCount < 3) {
-          processedFaces.push({
-            ...face,
-            status: 'validating',
-            validationProgress: Math.round(
-              (currentCount / 3) * 100
-            ),
-            student: {
-              id: student._id,
-              name: student.name,
-              rollNumber: student.rollNumber
-            }
-          });
-
           continue;
         }
 
         if (existingRecord) {
           existingRecord.status = 'Present';
-          existingRecord.markedBy = req.user._id;
+          existingRecord.markedBy = req.user ? req.user._id : undefined;
           existingRecord.timestamp = new Date();
-
           await existingRecord.save();
         } else {
           await Attendance.create({
             student: student._id,
             date: todayStr,
             status: 'Present',
-            markedBy: req.user._id
+            markedBy: req.user ? req.user._id : undefined
           });
         }
 
         processedFaces.push({
           ...face,
+          matched: true,
           status: 'recognized',
-          alreadyMarked,
+          alreadyMarked: false,
           student: {
             id: student._id,
             name: student.name,
@@ -351,26 +383,8 @@ exports.recognizeFace = async (req, res) => {
 
     const face = result.faces[0]; // REMOVED: Loop over all faces instead
 
-    // Phase 1: Load from Node.js memory cache instead of MongoDB
-    if (!studentEmbeddingsCache || (Date.now() - studentEmbeddingsCacheTime) > CACHE_TTL_MS) {
-      console.log('[CACHE MISS] Fetching student embeddings from MongoDB...');
-      studentEmbeddingsCache = await Student.find(
-        {
-          embeddings: {
-            $exists: true,
-            $not: { $size: 0 }
-          }
-        },
-        {
-          _id: 1,
-          name: 1,
-          rollNumber: 1,
-          embeddings: 1
-        }
-      ).lean();
-      studentEmbeddingsCacheTime = Date.now();
-    }
-    const students = studentEmbeddingsCache;
+    // Phase 1: Load from Node.js memory cache instead of MongoDB (with outlier filtering)
+    const students = await getCachedStudents();
 
     const recognizedCandidates = [];
     const currentFrameMatches = new Set();
@@ -402,22 +416,16 @@ exports.recognizeFace = async (req, res) => {
         for (const student of students) {
             if (!student.embeddings || student.embeddings.length === 0) continue;
             
-            let minDistanceForThisStudent = 1.0;
-            for (const refEmbedding of student.embeddings) {
-                const dist = cosineDistance(currentFace.embedding, refEmbedding);
-                if (dist < minDistanceForThisStudent) {
-                    minDistanceForThisStudent = dist;
-                }
-            }
+            const studentDist = getStudentMatchDistance(currentFace.embedding, student.embeddings);
             
-            if (minDistanceForThisStudent < closestObserved) closestObserved = minDistanceForThisStudent;
+            if (studentDist < closestObserved) closestObserved = studentDist;
 
-            if (minDistanceForThisStudent < candidateBestDistance) {
+            if (studentDist < candidateBestDistance) {
                 candidateSecondBestDistance = candidateBestDistance;
-                candidateBestDistance = minDistanceForThisStudent;
+                candidateBestDistance = studentDist;
                 candidateMatch = student;
-            } else if (minDistanceForThisStudent < candidateSecondBestDistance) {
-                candidateSecondBestDistance = minDistanceForThisStudent;
+            } else if (studentDist < candidateSecondBestDistance) {
+                candidateSecondBestDistance = studentDist;
             }
         }
         

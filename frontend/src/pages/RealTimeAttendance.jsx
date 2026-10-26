@@ -365,7 +365,7 @@ const RealTimeAttendance = () => {
       }));
 
       if (!result.faceDetected) {
-        if (Date.now() - recognitionHoldRef.current.timestamp < 3000) {
+        if (Date.now() - recognitionHoldRef.current.timestamp < 1000) {
           console.log("[STABILITY] Holding previous identity (no face)");
           return;
         }
@@ -414,11 +414,9 @@ const RealTimeAttendance = () => {
           return prevPending;
         });
       } else {
-        if (Date.now() - recognitionHoldRef.current.timestamp < 3000) {
-          console.log("[STABILITY] Holding previous identity (ignoring unknown)");
-          return;
-        }
-        console.log("[STABILITY] Identity cleared (unknown face)");
+        // Unknown or ambiguous face: immediately reset hold so previous student name isn't shown
+        recognitionHoldRef.current = { studentId: null, timestamp: 0 };
+        console.log("[STABILITY] Identity cleared (unknown face in frame)");
         setDetectedStudent({
           name: "Unknown",
           id: "-",
